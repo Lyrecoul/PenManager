@@ -99,7 +99,7 @@ pub fn list_plugins(
             restart_required: changed.contains(&metadata.id),
         });
     }
-    result.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    result.sort_by_key(|plugin| plugin.name.to_lowercase());
     Ok(result)
 }
 

@@ -1,0 +1,7 @@
+node_modules/
+dist/
+src-tauri/target/
+src-tauri/binaries/adb-*
+src-tauri/binaries/*.dll
+*.log
+.DS_Store

@@ -389,8 +389,7 @@ fn parse_performance_snapshot(raw: &str) -> AppResult<PerformanceSnapshot> {
     let (header, process_data) = raw
         .split_once("@@PROCESSES@@")
         .ok_or_else(|| AppError::Device("设备性能数据格式无效".into()))?;
-    let process_data =
-        process_data.trim_start_matches(|character| matches!(character, '\r' | '\n'));
+    let process_data = process_data.trim_start_matches(['\r', '\n']);
     let mut sections: HashMap<&str, String> = HashMap::new();
     let mut current = "";
     for line in header.lines() {
