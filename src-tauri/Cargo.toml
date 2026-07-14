@@ -1,0 +1,39 @@
+[package]
+name = "pen-manager"
+version = "0.1.1"
+description = "Cross-platform manager for Youdao Dictionary Pen"
+authors = ["PenManager contributors"]
+edition = "2024"
+
+[lib]
+name = "pen_manager_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tempfile = "3"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+zip = { version = "4", default-features = false, features = ["deflate", "deflate64", "bzip2", "zstd"] }
+
+[target.'cfg(windows)'.dependencies]
+ssh2 = "0.9"
+
+[target.'cfg(not(windows))'.dependencies]
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = "s"
+panic = "abort"
+strip = true
