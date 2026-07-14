@@ -60,6 +60,9 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Prepare ADB sidecar
+        run: npm run prepare:adb
+
       - name: Verify project versions
         run: >-
           node -e "const fs=require('node:fs');
