@@ -21,9 +21,15 @@ impl DeviceConnection {
         if profile.id.trim().is_empty() || profile.name.trim().is_empty() {
             return Err(AppError::InvalidProfile("连接配置缺少名称或 ID".into()));
         }
+        let adb_path = matches!(profile.transport, TransportKind::Adb).then(resolve_adb_program);
         match profile.transport {
             TransportKind::Adb => {
-                let serial = resolve_adb_serial(profile.serial.as_deref())?;
+                let serial = resolve_adb_serial(
+                    profile.serial.as_deref(),
+                    adb_path
+                        .as_deref()
+                        .expect("ADB connections have an ADB executable"),
+                )?;
                 profile.serial = Some(serial);
             }
             TransportKind::Ssh => {
@@ -32,7 +38,6 @@ impl DeviceConnection {
                 }
             }
         }
-        let adb_path = matches!(profile.transport, TransportKind::Adb).then(resolve_adb_program);
         let connection = Self { profile, adb_path };
         connection.exec("true")?;
         Ok(connection)
@@ -52,6 +57,7 @@ impl DeviceConnection {
     pub(crate) fn adb_base(&self) -> Command {
         let mut command =
             Command::new(self.adb_path.as_deref().unwrap_or_else(|| Path::new("adb")));
+        hide_console_window(&mut command);
         if let Some(serial) = &self.profile.serial {
             command.args(["-s", serial]);
         }
@@ -322,11 +328,13 @@ fn resolve_adb_program() -> PathBuf {
     PathBuf::from("adb")
 }
 
-fn resolve_adb_serial(requested: Option<&str>) -> AppResult<String> {
+fn resolve_adb_serial(requested: Option<&str>, adb_path: &Path) -> AppResult<String> {
     if let Some(serial) = requested.filter(|value| !value.is_empty()) {
         return Ok(serial.to_string());
     }
-    let output = Command::new("adb")
+    let mut command = Command::new(adb_path);
+    hide_console_window(&mut command);
+    let output = command
         .arg("devices")
         .output()
         .map_err(|error| AppError::Device(format!("无法启动 adb：{error}")))?;
@@ -345,6 +353,17 @@ fn resolve_adb_serial(requested: Option<&str>) -> AppResult<String> {
         _ => Err(AppError::Device("发现多个 ADB 设备，请指定序列号".into())),
     }
 }
+
+#[cfg(windows)]
+fn hide_console_window(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+
+    // ADB is a console executable. Prevent each background invocation from creating a window.
+    command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+}
+
+#[cfg(not(windows))]
+fn hide_console_window(_: &mut Command) {}
 
 fn ssh_command_output(
     session: &Session,

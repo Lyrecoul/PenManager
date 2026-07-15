@@ -379,7 +379,7 @@ fn read_performance_snapshot(connection: &DeviceConnection) -> AppResult<Perform
              esac; \
            done <\"$p/status\" 2>/dev/null; \
            cmd=$(tr '\\000' ' ' <\"$p/cmdline\" 2>/dev/null); \
-           printf '%s\\034%s\\034%s\\034%s\\000' \"$stat\" \"$rss\" \"$threads\" \"$cmd\"; \
+           printf '%s\\034%s\\034%s\\034%s\\036' \"$stat\" \"$rss\" \"$threads\" \"$cmd\"; \
          done",
     )?;
     parse_performance_snapshot(&output.output)
@@ -464,7 +464,8 @@ fn parse_performance_snapshot(raw: &str) -> AppResult<PerformanceSnapshot> {
             .reduce(f32::max)
     });
     let processes = process_data
-        .split('\0')
+        // Avoid NUL records: Windows ADB output handling may truncate or discard them.
+        .split('\u{1e}')
         .filter(|record| !record.is_empty())
         .filter_map(parse_process_record)
         .collect();
@@ -770,7 +771,7 @@ mod tests {
 
     #[test]
     fn parses_performance_snapshot_sections() {
-        let raw = "@@CPU@@\ncpu 100 0 50 850 10 0 0 0 0 0\n@@CPUCOUNT@@\n4\n@@LOAD@@\n0.10 0.20 0.30 1/100 123\n@@UPTIME@@\n3600.00 1000.00\n@@MEMORY@@\nMemTotal: 460352 kB\nMemAvailable: 230176 kB\nSwapTotal: 1024 kB\nSwapFree: 512 kB\n@@TEMP@@\n44545\n@@PROCESSES@@\n8262 (YoudaoDictPen) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 4 0 1 0 0\u{1c}1000\u{1c}4\u{1c}YoudaoDictPen\0";
+        let raw = "@@CPU@@\ncpu 100 0 50 850 10 0 0 0 0 0\n@@CPUCOUNT@@\n4\n@@LOAD@@\n0.10 0.20 0.30 1/100 123\n@@UPTIME@@\n3600.00 1000.00\n@@MEMORY@@\nMemTotal: 460352 kB\nMemAvailable: 230176 kB\nSwapTotal: 1024 kB\nSwapFree: 512 kB\n@@TEMP@@\n44545\n@@PROCESSES@@\n8262 (YoudaoDictPen) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 4 0 1 0 0\u{1c}1000\u{1c}4\u{1c}YoudaoDictPen\u{1e}";
         let snapshot = parse_performance_snapshot(raw).unwrap();
         assert_eq!(snapshot.cpu_total_ticks, 1010);
         assert_eq!(snapshot.cpu_idle_ticks, 860);
@@ -783,7 +784,7 @@ mod tests {
 
     #[test]
     fn parses_adb_crlf_performance_sections() {
-        let raw = "@@CPU@@\r\ncpu 100 0 50 850 10 0 0 0 0 0\r\n@@CPUCOUNT@@\r\n4\r\n@@LOAD@@\r\n0.10 0.20 0.30 1/100 123\r\n@@UPTIME@@\r\n3600.00 1000.00\r\n@@MEMORY@@\r\nMemTotal: 460352 kB\r\nMemAvailable: 230176 kB\r\nSwapTotal: 1024 kB\r\nSwapFree: 512 kB\r\n@@TEMP@@\r\n44545\r\n@@PROCESSES@@\r\n8262 (YoudaoDictPen) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 4 0 1 0 0\u{1c}1000\u{1c}4\u{1c}YoudaoDictPen\0";
+        let raw = "@@CPU@@\r\ncpu 100 0 50 850 10 0 0 0 0 0\r\n@@CPUCOUNT@@\r\n4\r\n@@LOAD@@\r\n0.10 0.20 0.30 1/100 123\r\n@@UPTIME@@\r\n3600.00 1000.00\r\n@@MEMORY@@\r\nMemTotal: 460352 kB\r\nMemAvailable: 230176 kB\r\nSwapTotal: 1024 kB\r\nSwapFree: 512 kB\r\n@@TEMP@@\r\n44545\r\n@@PROCESSES@@\r\n8262 (YoudaoDictPen) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 4 0 1 0 0\u{1c}1000\u{1c}4\u{1c}YoudaoDictPen\u{1e}";
         let snapshot = parse_performance_snapshot(raw).unwrap();
         assert_eq!(snapshot.cpu_count, 4);
         assert_eq!(snapshot.temperature_celsius, Some(44.545));
