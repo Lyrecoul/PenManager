@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "PenManager",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "identifier": "io.github.lyrecoul.penmanager",
   "build": {
     "beforeDevCommand": "npm run prepare:adb && npm run dev",
