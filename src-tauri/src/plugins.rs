@@ -1,7 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::models::{ArchivePlugin, PluginInfo, PluginMetadata};
 use crate::transport::{DeviceConnection, shell_quote};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -14,6 +14,7 @@ const PLUGIN_DIR: &str = "/userdisk/PenMods/plugins";
 const MAX_ENTRIES: usize = 10_000;
 const MAX_UNCOMPRESSED_SIZE: u64 = 256 * 1024 * 1024;
 const MAX_SINGLE_FILE_SIZE: u64 = 128 * 1024 * 1024;
+const MAX_CHMOD_COMMAND_LENGTH: usize = 4 * 1024;
 
 #[derive(Clone, Debug)]
 struct ArchiveCandidate {
@@ -21,6 +22,18 @@ struct ArchiveCandidate {
     install_dir: String,
     metadata: PluginMetadata,
     health: String,
+}
+
+#[derive(Debug)]
+struct ExtractedArchive {
+    directory: TempDir,
+    permissions: Vec<ArchivePermission>,
+}
+
+#[derive(Debug)]
+struct ArchivePermission {
+    path: PathBuf,
+    mode: u32,
 }
 
 pub fn list_plugins(
@@ -180,7 +193,7 @@ pub fn install_archive(
 
     for candidate in &selected {
         validate_plugin_id(&candidate.metadata.id)?;
-        let local_root = extraction.path().join(&candidate.root);
+        let local_root = extraction.directory.path().join(&candidate.root);
         if !enable {
             fs::write(local_root.join(".disabled"), [])?;
         } else {
@@ -207,6 +220,15 @@ pub fn install_archive(
         };
         let remote_stage = format!("{staging_root}/{}", candidate.install_dir);
         if let Err(error) = connection.upload_directory_contents(&local_root, &remote_stage) {
+            let _ = connection.remove_paths(std::slice::from_ref(&staging_root));
+            return Err(error);
+        }
+        if let Err(error) = restore_archive_permissions(
+            connection,
+            &extraction.permissions,
+            &candidate.root,
+            &remote_stage,
+        ) {
             let _ = connection.remove_paths(std::slice::from_ref(&staging_root));
             return Err(error);
         }
@@ -427,8 +449,9 @@ fn discover_archive(path: &Path) -> AppResult<Vec<ArchiveCandidate>> {
     Ok(candidates)
 }
 
-fn extract_archive(path: &Path) -> AppResult<TempDir> {
-    let destination = tempfile::tempdir()?;
+fn extract_archive(path: &Path) -> AppResult<ExtractedArchive> {
+    let directory = tempfile::tempdir()?;
+    let mut permissions = Vec::new();
     let file = fs::File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
     for index in 0..archive.len() {
@@ -447,19 +470,88 @@ fn extract_archive(path: &Path) -> AppResult<TempDir> {
                 entry.name()
             )));
         }
-        let output = destination.path().join(relative);
+        let output = directory.path().join(&relative);
         if entry.is_dir() {
             fs::create_dir_all(&output)?;
-            continue;
+        } else {
+            if let Some(parent) = output.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut file = fs::File::create(&output)?;
+            std::io::copy(&mut entry, &mut file)?;
+            file.flush()?;
         }
-        if let Some(parent) = output.parent() {
-            fs::create_dir_all(parent)?;
+        if let Some(mode) = entry.unix_mode() {
+            permissions.push(ArchivePermission {
+                path: relative,
+                // Do not grant setuid, setgid, or sticky privileges from an untrusted archive.
+                mode: mode & 0o777,
+            });
         }
-        let mut file = fs::File::create(&output)?;
-        std::io::copy(&mut entry, &mut file)?;
-        file.flush()?;
     }
-    Ok(destination)
+    Ok(ExtractedArchive {
+        directory,
+        permissions,
+    })
+}
+
+fn restore_archive_permissions(
+    connection: &DeviceConnection,
+    permissions: &[ArchivePermission],
+    root: &Path,
+    remote_root: &str,
+) -> AppResult<()> {
+    for command in chmod_commands(&archive_permission_paths(permissions, root, remote_root)) {
+        connection.exec(&command)?;
+    }
+    Ok(())
+}
+
+fn archive_permission_paths(
+    permissions: &[ArchivePermission],
+    root: &Path,
+    remote_root: &str,
+) -> Vec<(String, u32)> {
+    permissions
+        .iter()
+        .filter_map(|permission| {
+            let relative = permission.path.strip_prefix(root).ok()?;
+            let remote_path = if relative.as_os_str().is_empty() {
+                remote_root.to_string()
+            } else {
+                format!("{remote_root}/{}", relative.to_string_lossy())
+            };
+            Some((remote_path, permission.mode))
+        })
+        .collect()
+}
+
+fn chmod_commands(paths: &[(String, u32)]) -> Vec<String> {
+    let mut by_mode = BTreeMap::<u32, Vec<&str>>::new();
+    for (path, mode) in paths {
+        by_mode.entry(*mode).or_default().push(path);
+    }
+
+    let mut commands = Vec::new();
+    for (mode, paths) in by_mode {
+        let prefix = format!("chmod {mode:04o}");
+        let mut command = prefix.clone();
+        for path in paths {
+            let quoted = shell_quote(path);
+            if command.len() + quoted.len() + 1 > MAX_CHMOD_COMMAND_LENGTH
+                && command != prefix
+            {
+                commands.push(command);
+                command = prefix.clone();
+            }
+            command.push(' ');
+            command.push_str(&quoted);
+        }
+        if command != prefix {
+            commands.push(command);
+        }
+    }
+    commands
 }
 
 fn validate_archive_path(path: &Path) -> AppResult<()> {
@@ -676,5 +768,81 @@ mod tests {
             ("b/metadata.json", r#"{"id":"com.test.same"}"#),
         ]);
         assert!(inspect_archive(archive.path()).is_err());
+    }
+
+    #[test]
+    fn restores_archive_file_and_directory_permissions_after_upload() {
+        let archive = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut writer = zip::ZipWriter::new(archive.reopen().unwrap());
+            writer
+                .add_directory("plugin/", SimpleFileOptions::default().unix_permissions(0o750))
+                .unwrap();
+            writer
+                .start_file(
+                    "plugin/run.sh",
+                    SimpleFileOptions::default().unix_permissions(0o755),
+                )
+                .unwrap();
+            writer.write_all(b"#!/bin/sh\n").unwrap();
+            writer
+                .start_file(
+                    "plugin/metadata.json",
+                    SimpleFileOptions::default().unix_permissions(0o640),
+                )
+                .unwrap();
+            writer
+                .write_all(br#"{"id":"com.test.permissions"}"#)
+                .unwrap();
+            writer.finish().unwrap();
+        }
+
+        let extraction = extract_archive(archive.path()).unwrap();
+        let permissions = extraction
+            .permissions
+            .iter()
+            .map(|permission| (permission.path.to_string_lossy().into_owned(), permission.mode))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            permissions,
+            vec![
+                ("plugin".into(), 0o750),
+                ("plugin/run.sh".into(), 0o755),
+                ("plugin/metadata.json".into(), 0o640),
+            ]
+        );
+
+        let remote_permissions = archive_permission_paths(
+            &extraction.permissions,
+            Path::new("plugin"),
+            "/stage",
+        );
+        let commands = chmod_commands(&remote_permissions);
+        assert!(commands.contains(&"chmod 0750 '/stage'".into()));
+        assert!(commands.contains(&"chmod 0755 '/stage/plugin/run.sh'".into()));
+        assert!(commands.contains(&"chmod 0640 '/stage/plugin/metadata.json'".into()));
+    }
+
+    #[test]
+    fn only_restores_permissions_belonging_to_the_selected_plugin() {
+        let permissions = vec![
+            ArchivePermission {
+                path: PathBuf::from("first/run.sh"),
+                mode: 0o755,
+            },
+            ArchivePermission {
+                path: PathBuf::from("second/private.conf"),
+                mode: 0o600,
+            },
+        ];
+        assert_eq!(
+            archive_permission_paths(&permissions, Path::new("first"), "/stage/first"),
+            vec![("/stage/first/run.sh".into(), 0o755)]
+        );
+    }
+
+    #[test]
+    fn leaves_entries_without_unix_permissions_at_default_mode() {
+        assert!(chmod_commands(&[]).is_empty());
     }
 }
