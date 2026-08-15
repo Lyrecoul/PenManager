@@ -822,8 +822,8 @@ mod tests {
             archive_permission_paths(&extraction.permissions, Path::new("plugin"), "/stage");
         let commands = chmod_commands(&remote_permissions);
         assert!(commands.contains(&"chmod 0750 '/stage'".into()));
-        assert!(commands.contains(&"chmod 0755 '/stage/plugin/run.sh'".into()));
-        assert!(commands.contains(&"chmod 0640 '/stage/plugin/metadata.json'".into()));
+        assert!(commands.contains(&"chmod 0755 '/stage/run.sh'".into()));
+        assert!(commands.contains(&"chmod 0640 '/stage/metadata.json'".into()));
     }
 
     #[test]
