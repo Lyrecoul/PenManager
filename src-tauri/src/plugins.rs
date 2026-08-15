@@ -538,9 +538,7 @@ fn chmod_commands(paths: &[(String, u32)]) -> Vec<String> {
         let mut command = prefix.clone();
         for path in paths {
             let quoted = shell_quote(path);
-            if command.len() + quoted.len() + 1 > MAX_CHMOD_COMMAND_LENGTH
-                && command != prefix
-            {
+            if command.len() + quoted.len() + 1 > MAX_CHMOD_COMMAND_LENGTH && command != prefix {
                 commands.push(command);
                 command = prefix.clone();
             }
@@ -776,7 +774,10 @@ mod tests {
         {
             let mut writer = zip::ZipWriter::new(archive.reopen().unwrap());
             writer
-                .add_directory("plugin/", SimpleFileOptions::default().unix_permissions(0o750))
+                .add_directory(
+                    "plugin/",
+                    SimpleFileOptions::default().unix_permissions(0o750),
+                )
                 .unwrap();
             writer
                 .start_file(
@@ -801,7 +802,12 @@ mod tests {
         let permissions = extraction
             .permissions
             .iter()
-            .map(|permission| (permission.path.to_string_lossy().into_owned(), permission.mode))
+            .map(|permission| {
+                (
+                    permission.path.to_string_lossy().into_owned(),
+                    permission.mode,
+                )
+            })
             .collect::<Vec<_>>();
         assert_eq!(
             permissions,
@@ -812,11 +818,8 @@ mod tests {
             ]
         );
 
-        let remote_permissions = archive_permission_paths(
-            &extraction.permissions,
-            Path::new("plugin"),
-            "/stage",
-        );
+        let remote_permissions =
+            archive_permission_paths(&extraction.permissions, Path::new("plugin"), "/stage");
         let commands = chmod_commands(&remote_permissions);
         assert!(commands.contains(&"chmod 0750 '/stage'".into()));
         assert!(commands.contains(&"chmod 0755 '/stage/plugin/run.sh'".into()));
