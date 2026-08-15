@@ -812,7 +812,7 @@ mod tests {
         assert_eq!(
             permissions,
             vec![
-                ("plugin".into(), 0o750),
+                ("plugin/".into(), 0o750),
                 ("plugin/run.sh".into(), 0o755),
                 ("plugin/metadata.json".into(), 0o640),
             ]
