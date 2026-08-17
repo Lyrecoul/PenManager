@@ -7,7 +7,7 @@ use crate::models::{
 };
 use crate::plugins;
 use crate::terminal::{TerminalManager, TerminalMessage};
-use crate::transport::{DeviceConnection, remote_join, shell_quote};
+use crate::transport::{DeviceConnection, remote_join, shell_quote, shell_script_command};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -360,28 +360,36 @@ pub fn restart_main_app(state: State<'_, AppState>) -> AppResult<()> {
 }
 
 fn read_performance_snapshot(connection: &DeviceConnection) -> AppResult<PerformanceSnapshot> {
-    let output = connection.exec(
-        "printf '@@CPU@@\\n'; head -1 /proc/stat; \
-         printf '@@CPUCOUNT@@\\n'; grep -c '^cpu[0-9]' /proc/stat; \
-         printf '@@LOAD@@\\n'; cat /proc/loadavg; \
-         printf '@@UPTIME@@\\n'; cat /proc/uptime; \
-         printf '@@MEMORY@@\\n'; cat /proc/meminfo; \
-         printf '@@TEMP@@\\n'; for f in /sys/class/thermal/thermal_zone*/temp; do cat \"$f\" 2>/dev/null; done; \
-         printf '@@PROCESSES@@\\n'; \
-         for p in /proc/[0-9]*; do \
-           [ -r \"$p/stat\" ] || continue; \
-           IFS= read -r stat <\"$p/stat\" 2>/dev/null || continue; \
-           rss=0; threads=1; \
-           while IFS=: read -r key value; do \
-             case \"$key\" in \
-               VmRSS) set -- $value; rss=${1:-0} ;; \
-               Threads) set -- $value; threads=${1:-1} ;; \
-             esac; \
-           done <\"$p/status\" 2>/dev/null; \
-           cmd=$(tr '\\000' ' ' <\"$p/cmdline\" 2>/dev/null); \
-           printf '%s\\034%s\\034%s\\034%s\\036' \"$stat\" \"$rss\" \"$threads\" \"$cmd\"; \
-         done",
-    )?;
+    // Each process is written as two plain-text lines: the raw
+    // `/proc/<pid>/stat` line, then a metadata line "rss_kib threads command".
+    // Only printable ASCII and newlines are used on the wire, so Windows ADB
+    // output handling cannot drop the separators the way it drops binary
+    // control characters (NUL / RS / FS); CRLF newlines are normalized by the
+    // parser. The whole script is transported as `sh -c '<script>'`, using the
+    // same single-quote escaping convention as adb itself, so the command
+    // survives Windows command-line handling regardless of how adb re-quotes
+    // shell commands on the host.
+    let script = "printf '@@CPU@@\\n'; head -1 /proc/stat; \
+                  printf '@@CPUCOUNT@@\\n'; grep -c '^cpu[0-9]' /proc/stat; \
+                  printf '@@LOAD@@\\n'; cat /proc/loadavg; \
+                  printf '@@UPTIME@@\\n'; cat /proc/uptime; \
+                  printf '@@MEMORY@@\\n'; cat /proc/meminfo; \
+                  printf '@@TEMP@@\\n'; for f in /sys/class/thermal/thermal_zone*/temp; do cat \"$f\" 2>/dev/null; done; \
+                  printf '@@PROCESSES@@\\n'; \
+                  for p in /proc/[0-9]*; do \
+                    [ -r \"$p/stat\" ] || continue; \
+                    IFS= read -r stat <\"$p/stat\" 2>/dev/null || continue; \
+                    rss=0; threads=1; \
+                    while IFS=: read -r key value; do \
+                      case \"$key\" in \
+                        VmRSS) set -- $value; rss=${1:-0} ;; \
+                        Threads) set -- $value; threads=${1:-1} ;; \
+                      esac; \
+                    done <\"$p/status\" 2>/dev/null; \
+                    cmd=$(tr '\\000' ' ' <\"$p/cmdline\" 2>/dev/null); \
+                    printf '%s\\n%s %s %s\\n' \"$stat\" \"$rss\" \"$threads\" \"$cmd\"; \
+                  done";
+    let output = connection.exec(&shell_script_command(script))?;
     parse_performance_snapshot(&output.output)
 }
 
@@ -463,12 +471,7 @@ fn parse_performance_snapshot(raw: &str) -> AppResult<PerformanceSnapshot> {
             })
             .reduce(f32::max)
     });
-    let processes = process_data
-        // Avoid NUL records: Windows ADB output handling may truncate or discard them.
-        .split('\u{1e}')
-        .filter(|record| !record.is_empty())
-        .filter_map(parse_process_record)
-        .collect();
+    let processes = parse_process_records(process_data);
 
     Ok(PerformanceSnapshot {
         timestamp_ms: SystemTime::now()
@@ -503,12 +506,28 @@ fn parse_meminfo(raw: &str) -> HashMap<&str, u64> {
         .collect()
 }
 
-fn parse_process_record(record: &str) -> Option<ProcessInfo> {
-    let fields = record.splitn(4, '\u{1c}').collect::<Vec<_>>();
-    if fields.len() != 4 {
-        return None;
+/// Parse the `@@PROCESSES@@` section. Every process occupies two plain-text
+/// lines: the raw `/proc/<pid>/stat` line, followed by a metadata line of the
+/// form `<rss-kib> <threads> <command>`. No binary control separators are used
+/// on the wire, so Windows ADB output handling cannot drop them; CRLF newlines
+/// (which Windows ADB produces) are stripped before parsing. A trailing lone
+/// line (for example interrupted output or device stderr appended to stdout)
+/// is ignored.
+fn parse_process_records(process_data: &str) -> Vec<ProcessInfo> {
+    let mut lines = process_data
+        .split(['\n', '\u{1e}', '\0'])
+        .map(|line| line.trim_end_matches('\r'))
+        .filter(|line| !line.trim().is_empty());
+    let mut processes = Vec::new();
+    while let (Some(stat), Some(metadata)) = (lines.next(), lines.next()) {
+        if let Some(process) = parse_process_record(stat, metadata) {
+            processes.push(process);
+        }
     }
-    let stat = fields[0];
+    processes
+}
+
+fn parse_process_record(stat: &str, metadata: &str) -> Option<ProcessInfo> {
     let open = stat.find('(')?;
     let close = stat.rfind(") ")?;
     let pid = stat[..open].trim().parse().ok()?;
@@ -521,10 +540,12 @@ fn parse_process_record(record: &str) -> Option<ProcessInfo> {
         .parse::<u64>()
         .ok()?
         .saturating_add(values[12].parse().ok()?);
-    let command = if fields[3].trim().is_empty() {
-        name.clone()
-    } else {
-        fields[3].trim().to_string()
+    let mut metadata_fields = metadata.splitn(3, ' ');
+    let rss_kib = metadata_fields.next()?.parse::<u64>().ok()?;
+    let threads = metadata_fields.next()?.parse::<u32>().ok().unwrap_or(1);
+    let command = match metadata_fields.next() {
+        Some(command) if !command.trim().is_empty() => command.trim().to_string(),
+        _ => name.clone(),
     };
     Some(ProcessInfo {
         pid,
@@ -533,8 +554,8 @@ fn parse_process_record(record: &str) -> Option<ProcessInfo> {
         command,
         state: values[0].to_string(),
         cpu_ticks,
-        memory_bytes: fields[1].parse::<u64>().unwrap_or(0) * 1024,
-        threads: fields[2].parse().unwrap_or(1),
+        memory_bytes: rss_kib.saturating_mul(1024),
+        threads,
         nice: values[16].parse().unwrap_or(0),
     })
 }
@@ -759,19 +780,31 @@ mod tests {
 
     #[test]
     fn parses_linux_process_stat_record() {
-        let record = "8262 (YoudaoDictPen) S 8239 144 144 0 -1 4194560 82151 150537 132 37 3048 1094 340 772 20 0 44 0 180534 2335383552 46675\u{1c}186700\u{1c}44\u{1c}./YoudaoDictPen -platform wayland ";
-        let process = parse_process_record(record).unwrap();
+        let stat = "8262 (YoudaoDictPen) S 8239 144 144 0 -1 4194560 82151 150537 132 37 3048 1094 340 772 20 0 44 0 180534 2335383552 46675";
+        let process = parse_process_record(stat, "186700 44 ./YoudaoDictPen -platform wayland ").unwrap();
         assert_eq!(process.pid, 8262);
         assert_eq!(process.parent_pid, 8239);
         assert_eq!(process.name, "YoudaoDictPen");
         assert_eq!(process.cpu_ticks, 4142);
         assert_eq!(process.memory_bytes, 191_180_800);
         assert_eq!(process.threads, 44);
+        assert_eq!(process.command, "./YoudaoDictPen -platform wayland");
+    }
+
+    #[test]
+    fn parses_linux_process_record_without_command() {
+        let stat = "10 (kworker/0:0) I 2 0 0 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 4 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
+        let process = parse_process_record(stat, "0 1").unwrap();
+        assert_eq!(process.pid, 10);
+        assert_eq!(process.name, "kworker/0:0");
+        assert_eq!(process.command, "kworker/0:0");
+        assert_eq!(process.memory_bytes, 0);
+        assert_eq!(process.threads, 1);
     }
 
     #[test]
     fn parses_performance_snapshot_sections() {
-        let raw = "@@CPU@@\ncpu 100 0 50 850 10 0 0 0 0 0\n@@CPUCOUNT@@\n4\n@@LOAD@@\n0.10 0.20 0.30 1/100 123\n@@UPTIME@@\n3600.00 1000.00\n@@MEMORY@@\nMemTotal: 460352 kB\nMemAvailable: 230176 kB\nSwapTotal: 1024 kB\nSwapFree: 512 kB\n@@TEMP@@\n44545\n@@PROCESSES@@\n8262 (YoudaoDictPen) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 4 0 1 0 0\u{1c}1000\u{1c}4\u{1c}YoudaoDictPen\u{1e}";
+        let raw = "@@CPU@@\ncpu 100 0 50 850 10 0 0 0 0 0\n@@CPUCOUNT@@\n4\n@@LOAD@@\n0.10 0.20 0.30 1/100 123\n@@UPTIME@@\n3600.00 1000.00\n@@MEMORY@@\nMemTotal: 460352 kB\nMemAvailable: 230176 kB\nSwapTotal: 1024 kB\nSwapFree: 512 kB\n@@TEMP@@\n44545\n@@PROCESSES@@\n8262 (YoudaoDictPen) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 4 0 1 0 0\n1000 4 YoudaoDictPen\n";
         let snapshot = parse_performance_snapshot(raw).unwrap();
         assert_eq!(snapshot.cpu_total_ticks, 1010);
         assert_eq!(snapshot.cpu_idle_ticks, 860);
@@ -780,14 +813,46 @@ mod tests {
         assert_eq!(snapshot.swap_used, 524_288);
         assert_eq!(snapshot.temperature_celsius, Some(44.545));
         assert_eq!(snapshot.processes.len(), 1);
+        assert_eq!(snapshot.processes[0].pid, 8262);
+        assert_eq!(snapshot.processes[0].memory_bytes, 1_024_000);
+        assert_eq!(snapshot.processes[0].threads, 4);
     }
 
     #[test]
     fn parses_adb_crlf_performance_sections() {
-        let raw = "@@CPU@@\r\ncpu 100 0 50 850 10 0 0 0 0 0\r\n@@CPUCOUNT@@\r\n4\r\n@@LOAD@@\r\n0.10 0.20 0.30 1/100 123\r\n@@UPTIME@@\r\n3600.00 1000.00\r\n@@MEMORY@@\r\nMemTotal: 460352 kB\r\nMemAvailable: 230176 kB\r\nSwapTotal: 1024 kB\r\nSwapFree: 512 kB\r\n@@TEMP@@\r\n44545\r\n@@PROCESSES@@\r\n8262 (YoudaoDictPen) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 4 0 1 0 0\u{1c}1000\u{1c}4\u{1c}YoudaoDictPen\u{1e}";
+        // Windows ADB converts device output newlines to CRLF but keeps the
+        // plain-text two-line process records intact.
+        let raw = "@@CPU@@\r\ncpu 100 0 50 850 10 0 0 0 0 0\r\n@@CPUCOUNT@@\r\n4\r\n@@LOAD@@\r\n0.10 0.20 0.30 1/100 123\r\n@@UPTIME@@\r\n3600.00 1000.00\r\n@@MEMORY@@\r\nMemTotal: 460352 kB\r\nMemAvailable: 230176 kB\r\nSwapTotal: 1024 kB\r\nSwapFree: 512 kB\r\n@@TEMP@@\r\n44545\r\n@@PROCESSES@@\r\n8262 (YoudaoDictPen) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 4 0 1 0 0\r\n1000 4 YoudaoDictPen\r\n";
         let snapshot = parse_performance_snapshot(raw).unwrap();
         assert_eq!(snapshot.cpu_count, 4);
         assert_eq!(snapshot.temperature_celsius, Some(44.545));
         assert_eq!(snapshot.processes.len(), 1);
+        assert_eq!(snapshot.processes[0].command, "YoudaoDictPen");
+    }
+
+    #[test]
+    fn parses_processes_even_when_binary_separators_are_stripped() {
+        // The previous protocol embedded FS (0x1C) field separators inside each
+        // record; Windows ADB output handling drops such binary control bytes,
+        // collapsing every record into one field and yielding an empty table.
+        // The plain-text format must not depend on them: strip all of them and
+        // verify the snapshot still parses.
+        let stat = "8262 (YoudaoDictPen) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 4 0 1 0 0";
+        let raw = format!(
+            "@@CPU@@\ncpu 100 0 50 850 10 0 0 0 0 0\n@@CPUCOUNT@@\n4\n@@PROCESSES@@\n{stat}\n1000 4 YoudaoDictPen\n"
+        );
+        let snapshot = parse_performance_snapshot(&raw).unwrap();
+        assert_eq!(snapshot.processes.len(), 1);
+        assert_eq!(snapshot.processes[0].name, "YoudaoDictPen");
+    }
+
+    #[test]
+    fn ignores_lone_trailing_line_in_processes_section() {
+        // Device stderr is appended to stdout by the transport; an odd trailing
+        // line must not produce a bogus process record.
+        let raw = "@@CPU@@\ncpu 100 0 50 850 10 0 0 0 0 0\n@@CPUCOUNT@@\n4\n@@PROCESSES@@\n8262 (YoudaoDictPen) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 4 0 1 0 0\n1000 4 YoudaoDictPen\nsh: stray stderr line\n";
+        let snapshot = parse_performance_snapshot(raw).unwrap();
+        assert_eq!(snapshot.processes.len(), 1);
+        assert_eq!(snapshot.processes[0].pid, 8262);
     }
 }
