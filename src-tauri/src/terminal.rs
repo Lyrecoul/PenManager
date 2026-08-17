@@ -138,7 +138,7 @@ fn run_adb_terminal(
         }
         match receiver.recv_timeout(Duration::from_millis(30)) {
             Ok(TerminalMessage::Input(data)) => {
-                stdin.write_all(data.as_bytes())?;
+                stdin.write_all(normalize_adb_input(&data).as_bytes())?;
                 stdin.flush()?;
             }
             Ok(TerminalMessage::Resize(_, _)) => {}
@@ -213,6 +213,18 @@ fn run_ssh_terminal(
     Ok(())
 }
 
+/// Convert carriage returns to line feeds before writing to the interactive
+/// `adb shell` process. xterm sends `\r` (0x0D) for the Enter key, but
+/// adb.exe on Windows buffers lone CR bytes coming from a piped stdin and
+/// only forwards them once further input arrives: the first Enter appears
+/// dead and the second one arrives as two CRs, executing twice. Shells treat
+/// LF as the line terminator, so translating CR to LF makes every Enter
+/// forward immediately and submit exactly one line. This also fixes pasting
+/// multi-line text, which xterm delivers with CR line breaks.
+fn normalize_adb_input(data: &str) -> String {
+    data.replace('\r', "\n")
+}
+
 fn spawn_reader<R>(app: AppHandle, session_id: String, mut reader: R)
 where
     R: Read + Send + 'static,
@@ -242,4 +254,19 @@ fn emit_output(app: &AppHandle, session_id: &str, data: &str, closed: bool) {
             closed,
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_carriage_returns_to_line_feeds() {
+        assert_eq!(normalize_adb_input("echo hi\r"), "echo hi\n");
+        assert_eq!(normalize_adb_input("ls\rcd /\r"), "ls\ncd /\n");
+        assert_eq!(
+            normalize_adb_input("no carriage return"),
+            "no carriage return"
+        );
+    }
 }
