@@ -781,7 +781,8 @@ mod tests {
     #[test]
     fn parses_linux_process_stat_record() {
         let stat = "8262 (YoudaoDictPen) S 8239 144 144 0 -1 4194560 82151 150537 132 37 3048 1094 340 772 20 0 44 0 180534 2335383552 46675";
-        let process = parse_process_record(stat, "186700 44 ./YoudaoDictPen -platform wayland ").unwrap();
+        let process =
+            parse_process_record(stat, "186700 44 ./YoudaoDictPen -platform wayland ").unwrap();
         assert_eq!(process.pid, 8262);
         assert_eq!(process.parent_pid, 8239);
         assert_eq!(process.name, "YoudaoDictPen");

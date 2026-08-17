@@ -573,7 +573,10 @@ mod tests {
     fn wraps_shell_scripts_without_double_quotes() {
         let script = "printf '@@CPU@@\\n'; cat \"/proc/stat\"";
         let command = shell_script_command(script);
-        assert_eq!(command, "sh -c 'printf '\\''@@CPU@@\\n'\\''; cat \"/proc/stat\"'");
+        assert_eq!(
+            command,
+            "sh -c 'printf '\\''@@CPU@@\\n'\\''; cat \"/proc/stat\"'"
+        );
         // The wrapper itself must not introduce any double quotes: only the
         // script's own two `"` remain, and they sit inside a single-quoted
         // string, so Windows command-line parsing has nothing to mangle.
