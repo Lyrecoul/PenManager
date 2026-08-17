@@ -522,27 +522,6 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-/// Wrap a POSIX shell script as `sh -c '<script>'` so it can be handed to
-/// `adb shell` / SSH on any host. The script is transported inside a
-/// single-quoted string using the same `'\''` escape convention adb's own
-/// `escape_arg` uses, so the quoting structure survives Windows command-line
-/// argument parsing (single quotes are inert there) and composes correctly
-/// with any additional escaping adb applies. Only the script's own double
-/// quotes remain, enclosed within the single-quoted region.
-pub fn shell_script_command(script: &str) -> String {
-    let mut escaped = String::with_capacity(script.len() + 16);
-    escaped.push('\'');
-    for character in script.chars() {
-        if character == '\'' {
-            escaped.push_str("'\\''");
-        } else {
-            escaped.push(character);
-        }
-    }
-    escaped.push('\'');
-    format!("sh -c {escaped}")
-}
-
 pub(crate) fn ssh_path_export() -> String {
     format!("PATH={SSH_STANDARD_PATH}${{PATH:+:$PATH}}; export PATH;")
 }
@@ -567,28 +546,6 @@ mod tests {
     fn quotes_shell_values() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
-    }
-
-    #[test]
-    fn wraps_shell_scripts_without_double_quotes() {
-        let script = "printf '@@CPU@@\\n'; cat \"/proc/stat\"";
-        let command = shell_script_command(script);
-        assert_eq!(
-            command,
-            "sh -c 'printf '\\''@@CPU@@\\n'\\''; cat \"/proc/stat\"'"
-        );
-        // The wrapper itself must not introduce any double quotes: only the
-        // script's own two `"` remain, and they sit inside a single-quoted
-        // string, so Windows command-line parsing has nothing to mangle.
-        assert_eq!(command.matches('"').count(), 2);
-        assert!(command.starts_with("sh -c '"));
-        assert!(command.ends_with('\''));
-    }
-
-    #[test]
-    fn shell_script_command_escapes_embedded_single_quotes() {
-        let command = shell_script_command("echo 'a b'");
-        assert_eq!(command, "sh -c 'echo '\\''a b'\\'''");
     }
 
     #[test]

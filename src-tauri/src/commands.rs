@@ -7,7 +7,7 @@ use crate::models::{
 };
 use crate::plugins;
 use crate::terminal::{TerminalManager, TerminalMessage};
-use crate::transport::{DeviceConnection, remote_join, shell_quote, shell_script_command};
+use crate::transport::{DeviceConnection, remote_join, shell_quote};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -359,17 +359,20 @@ pub fn restart_main_app(state: State<'_, AppState>) -> AppResult<()> {
     Ok(())
 }
 
-fn read_performance_snapshot(connection: &DeviceConnection) -> AppResult<PerformanceSnapshot> {
-    // Each process is written as two plain-text lines: the raw
-    // `/proc/<pid>/stat` line, then a metadata line "rss_kib threads command".
-    // Only printable ASCII and newlines are used on the wire, so Windows ADB
-    // output handling cannot drop the separators the way it drops binary
-    // control characters (NUL / RS / FS); CRLF newlines are normalized by the
-    // parser. The whole script is transported as `sh -c '<script>'`, using the
-    // same single-quote escaping convention as adb itself, so the command
-    // survives Windows command-line handling regardless of how adb re-quotes
-    // shell commands on the host.
-    let script = "printf '@@CPU@@\\n'; head -1 /proc/stat; \
+/// Device-side location of the performance snapshot script. The script is
+/// transferred with `adb push` (binary safe) and executed with a bare
+/// `sh <path>` command, so no quotes, backslashes or shell metacharacters
+/// ever travel through the `adb shell` command line. This avoids Windows ADB
+/// command-line quoting issues entirely.
+const PERFORMANCE_SCRIPT_PATH: &str = "/data/local/tmp/penman-perf.sh";
+
+/// Each process is written as two plain-text lines: the raw
+/// `/proc/<pid>/stat` line, then a metadata line "rss_kib threads command".
+/// Only printable ASCII and newlines are used on the wire, so Windows ADB
+/// output handling cannot drop the separators the way it drops binary
+/// control characters (NUL / RS / FS); CRLF newlines are normalized by the
+/// parser.
+const PERFORMANCE_SCRIPT: &str = "printf '@@CPU@@\\n'; head -1 /proc/stat; \
                   printf '@@CPUCOUNT@@\\n'; grep -c '^cpu[0-9]' /proc/stat; \
                   printf '@@LOAD@@\\n'; cat /proc/loadavg; \
                   printf '@@UPTIME@@\\n'; cat /proc/uptime; \
@@ -389,15 +392,22 @@ fn read_performance_snapshot(connection: &DeviceConnection) -> AppResult<Perform
                     cmd=$(tr '\\000' ' ' <\"$p/cmdline\" 2>/dev/null); \
                     printf '%s\\n%s %s %s\\n' \"$stat\" \"$rss\" \"$threads\" \"$cmd\"; \
                   done";
-    let output = connection.exec(&shell_script_command(script))?;
+
+fn read_performance_snapshot(connection: &DeviceConnection) -> AppResult<PerformanceSnapshot> {
+    connection.write_file(PERFORMANCE_SCRIPT_PATH, PERFORMANCE_SCRIPT.as_bytes())?;
+    let output = connection.exec(&format!("sh {PERFORMANCE_SCRIPT_PATH}"))?;
     parse_performance_snapshot(&output.output)
 }
 
 fn parse_performance_snapshot(raw: &str) -> AppResult<PerformanceSnapshot> {
+    // Normalize line endings: ADB on Windows may emit CRLF, some devices emit
+    // bare CR. Converting all of them to LF keeps the section scan and the
+    // process-record pairing independent of the device's newline flavor.
+    let raw = raw.replace("\r\n", "\n").replace('\r', "\n");
     let (header, process_data) = raw
         .split_once("@@PROCESSES@@")
         .ok_or_else(|| AppError::Device("设备性能数据格式无效".into()))?;
-    let process_data = process_data.trim_start_matches(['\r', '\n']);
+    let process_data = process_data.trim_start_matches('\n');
     let mut sections: HashMap<&str, String> = HashMap::new();
     let mut current = "";
     for line in header.lines() {
@@ -829,6 +839,20 @@ mod tests {
         assert_eq!(snapshot.temperature_celsius, Some(44.545));
         assert_eq!(snapshot.processes.len(), 1);
         assert_eq!(snapshot.processes[0].command, "YoudaoDictPen");
+    }
+
+    #[test]
+    fn parses_cr_only_performance_sections() {
+        // Some device shells emit bare CR line endings; the parser must treat
+        // them as newlines instead of merging the whole output into one line
+        // (which would previously yield "缺少 CPU 统计").
+        let raw = "@@CPU@@\rcpu 100 0 50 850 10 0 0 0 0 0\r@@CPUCOUNT@@\r4\r@@LOAD@@\r0.10 0.20 0.30 1/100 123\r@@PROCESSES@@\r8262 (YoudaoDictPen) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 4 0 1 0 0\r1000 4 YoudaoDictPen\r";
+        let snapshot = parse_performance_snapshot(raw).unwrap();
+        assert_eq!(snapshot.cpu_total_ticks, 1010);
+        assert_eq!(snapshot.cpu_idle_ticks, 860);
+        assert_eq!(snapshot.cpu_count, 4);
+        assert_eq!(snapshot.processes.len(), 1);
+        assert_eq!(snapshot.processes[0].pid, 8262);
     }
 
     #[test]
