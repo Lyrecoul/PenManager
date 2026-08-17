@@ -401,37 +401,21 @@ fn read_performance_snapshot(connection: &DeviceConnection) -> AppResult<Perform
 
 fn parse_performance_snapshot(raw: &str) -> AppResult<PerformanceSnapshot> {
     // Normalize line endings: ADB on Windows may emit CRLF, some devices emit
-    // bare CR. Converting all of them to LF keeps the section scan and the
-    // process-record pairing independent of the device's newline flavor.
+    // bare CR, and some device shells emit no line breaks at all. Sections are
+    // therefore split on their `@@NAME@@` markers instead of relying on the
+    // newline structure of the output.
     let raw = raw.replace("\r\n", "\n").replace('\r', "\n");
     let (header, process_data) = raw
         .split_once("@@PROCESSES@@")
         .ok_or_else(|| AppError::Device("设备性能数据格式无效".into()))?;
     let process_data = process_data.trim_start_matches('\n');
-    let mut sections: HashMap<&str, String> = HashMap::new();
-    let mut current = "";
-    for line in header.lines() {
-        if line.starts_with("@@") && line.ends_with("@@") {
-            current = line.trim_matches('@');
-        } else if !current.is_empty() {
-            sections
-                .entry(current)
-                .or_default()
-                .push_str(&format!("{line}\n"));
-        }
-    }
+    let sections = parse_sections(header);
 
-    let cpu_values = sections
-        .get("CPU")
-        .and_then(|value| value.lines().next())
-        .ok_or_else(|| AppError::Device("缺少 CPU 统计".into()))?
-        .split_whitespace()
-        .skip(1)
-        .filter_map(|value| value.parse::<u64>().ok())
-        .collect::<Vec<_>>();
-    if cpu_values.len() < 4 {
-        return Err(AppError::Device("CPU 统计字段不足".into()));
-    }
+    let cpu_values = parse_cpu_values(&sections).ok_or_else(|| {
+        // Include an escaped snippet of the raw output so a still-malformed
+        // device response can be diagnosed from the error message alone.
+        AppError::Device(format!("CPU 统计字段不足：{}", debug_escape(&raw)))
+    })?;
     let cpu_total_ticks = cpu_values.iter().sum();
     let cpu_idle_ticks = cpu_values[3] + cpu_values.get(4).copied().unwrap_or(0);
     let cpu_count = section_first(&sections, "CPUCOUNT")
@@ -502,18 +486,93 @@ fn parse_performance_snapshot(raw: &str) -> AppResult<PerformanceSnapshot> {
     })
 }
 
+const SECTION_NAMES: [&str; 6] = ["CPU", "CPUCOUNT", "LOAD", "UPTIME", "MEMORY", "TEMP"];
+
+/// Split the header part of the snapshot into named sections by scanning for
+/// the `@@NAME@@` markers, taking everything between consecutive markers as
+/// that section's content. This is independent of the newline structure of
+/// the device output (LF, CRLF, bare CR, or no line breaks at all).
+fn parse_sections(header: &str) -> HashMap<&str, String> {
+    let mut sections: HashMap<&str, String> = HashMap::new();
+    let mut rest = header;
+    while let Some(start) = rest.find("@@") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find("@@") else { break };
+        let name = &after[..end];
+        if !SECTION_NAMES.contains(&name) {
+            rest = &after[end + 2..];
+            continue;
+        }
+        let content_start = start + 2 + end + 2;
+        let content_end = rest[content_start..]
+            .find("@@")
+            .map(|index| content_start + index)
+            .unwrap_or(rest.len());
+        sections.insert(name, rest[content_start..content_end].trim().to_string());
+        rest = &rest[content_end..];
+    }
+    sections
+}
+
 fn section_first<'a>(sections: &'a HashMap<&str, String>, name: &str) -> Option<&'a str> {
     sections.get(name)?.lines().next().map(str::trim)
 }
 
-fn parse_meminfo(raw: &str) -> HashMap<&str, u64> {
-    raw.lines()
-        .filter_map(|line| {
-            let (key, value) = line.split_once(':')?;
-            let number = value.split_whitespace().next()?.parse().ok()?;
-            Some((key, number))
+/// Find the CPU tick values in the CPU section. Some device shells emit a
+/// blank or stray line right after the `@@CPU@@` marker, so instead of
+/// requiring the first line to be the stat line, scan every line and take the
+/// first one that yields at least four numeric tick fields.
+fn parse_cpu_values(sections: &HashMap<&str, String>) -> Option<Vec<u64>> {
+    sections.get("CPU")?.lines().find_map(|line| {
+        let values = line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|value| value.parse::<u64>().ok())
+            .collect::<Vec<_>>();
+        (values.len() >= 4).then_some(values)
+    })
+}
+
+/// Render the beginning of the raw device output with control characters made
+/// visible (`\n`, `\r`, `\x1c`, ...), so a malformed response can be
+/// diagnosed from an error message alone.
+fn debug_escape(raw: &str) -> String {
+    raw.chars()
+        .take(400)
+        .map(|character| match character {
+            '\n' => "\\n".to_string(),
+            '\r' => "\\r".to_string(),
+            '\t' => "\\t".to_string(),
+            character if character.is_control() => {
+                format!("\\x{:02x}", character as u32)
+            }
+            character => character.to_string(),
         })
         .collect()
+}
+
+fn parse_meminfo(raw: &str) -> HashMap<&str, u64> {
+    let mut memory = HashMap::new();
+    for line in raw.lines() {
+        // A device shell may emit the whole meminfo as a single line, so scan
+        // every "Key: value" entry within each line instead of requiring one
+        // entry per line.
+        let mut rest = line;
+        while let Some(colon) = rest.find(':') {
+            let key = rest[..colon].split_whitespace().last().unwrap_or("");
+            let number = rest[colon + 1..]
+                .split_whitespace()
+                .next()
+                .and_then(|value| value.parse::<u64>().ok());
+            if !key.is_empty()
+                && let Some(number) = number
+            {
+                memory.insert(key, number);
+            }
+            rest = &rest[colon + 1..];
+        }
+    }
+    memory
 }
 
 /// Parse the `@@PROCESSES@@` section. Every process occupies two plain-text
@@ -853,6 +912,31 @@ mod tests {
         assert_eq!(snapshot.cpu_count, 4);
         assert_eq!(snapshot.processes.len(), 1);
         assert_eq!(snapshot.processes[0].pid, 8262);
+    }
+
+    #[test]
+    fn parses_cpu_section_with_leading_blank_line() {
+        // Some device shells emit a blank line right after the @@CPU@@ marker;
+        // the CPU scan must skip it and find the stat line.
+        let raw = "@@CPU@@\n\ncpu 100 0 50 850 10 0 0 0 0 0\n@@CPUCOUNT@@\n4\n@@PROCESSES@@\n";
+        let snapshot = parse_performance_snapshot(raw).unwrap();
+        assert_eq!(snapshot.cpu_total_ticks, 1010);
+        assert_eq!(snapshot.cpu_idle_ticks, 860);
+        assert_eq!(snapshot.cpu_count, 4);
+    }
+
+    #[test]
+    fn parses_single_line_output_without_newlines() {
+        // A device shell that emits no line breaks at all still yields a
+        // usable snapshot thanks to marker-based section splitting.
+        let raw = "@@CPU@@ cpu  32544 0 54148 287487 458 0 960 0 0 0 @@CPUCOUNT@@ 4 @@LOAD@@ 0.95 0.90 0.65 1/239 32348 @@UPTIME@@ 961.00 2964.10 @@MEMORY@@ MemTotal:         460352 kB MemFree:            9376 kB MemAvailable:     229988 kB @@TEMP@@ 44545 @@PROCESSES@@ 8262 (YoudaoDictPen) S 1 1 1 0 -1 0 0 0 0 0 100 50 0 0 20 0 4 0 1 0 0 1000 4 YoudaoDictPen";
+        let snapshot = parse_performance_snapshot(raw).unwrap();
+        assert_eq!(snapshot.cpu_total_ticks, 375_597);
+        assert_eq!(snapshot.cpu_idle_ticks, 287_945);
+        assert_eq!(snapshot.cpu_count, 4);
+        assert_eq!(snapshot.memory_total, 471_400_448);
+        assert_eq!(snapshot.memory_available, 235_507_712);
+        assert_eq!(snapshot.temperature_celsius, Some(44.545));
     }
 
     #[test]
